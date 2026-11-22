@@ -1,0 +1,23 @@
+schema_version = "1.0.0"
+
+id = "flightcheck"
+version = "1.0.0"
+name = "FlightCheck"
+tagline = "Real-time PBR, texel density, and scale pre-flight HUD"
+maintainer = "FlightCheck Team <dev@flightcheck.local>"
+type = "add-on"
+
+tags = ["Material", "Mesh", "3D View", "UV"]
+
+blender_version_min = "5.0.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "/.git/",
+  "/*.zip",
+]
