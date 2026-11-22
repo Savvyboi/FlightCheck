@@ -78,7 +78,7 @@ def get_socket(
     occurrence: int = 0,
 ) -> Optional[bpy.types.NodeSocket]:
     """Return the ``occurrence``-th enabled socket matching ``name`` (and optional ``socket_type``)."""
-    if occurrence < 0:
+    if sockets is None or occurrence < 0:
         return None
     matches = [
         sock
@@ -196,7 +196,7 @@ def _new_mix(
     node.clamp_result = clamp_result
     node.location = loc
     sock_type = "RGBA" if data_type == "RGBA" else ("VECTOR" if data_type == "VECTOR" else "VALUE")
-    _set_input(nt, get_socket(node.inputs, "Factor", socket_type="VALUE"), factor)
+    _set_input(nt, _get_factor_socket(node.inputs), factor)
     _set_input(nt, get_socket(node.inputs, "A", socket_type=sock_type), a)
     _set_input(nt, get_socket(node.inputs, "B", socket_type=sock_type), b)
     out = get_socket(node.outputs, "Result", socket_type=sock_type)
@@ -248,8 +248,15 @@ def _mask_or(
 
 
 def _get_or_create_shader_group(name: str) -> bpy.types.ShaderNodeTree:
+    for existing in bpy.data.node_groups:
+        if (
+            existing.name == name
+            and getattr(existing, "bl_idname", "") == "ShaderNodeTree"
+            and constants.is_editable_id(existing)
+        ):
+            return existing
     existing = bpy.data.node_groups.get(name)
-    if existing is not None:
+    if existing is not None and constants.is_editable_id(existing):
         if getattr(existing, "bl_idname", "") == "ShaderNodeTree":
             return existing
         bpy.data.node_groups.remove(existing, do_unlink=True)
@@ -271,6 +278,8 @@ def _interface_has_sockets(
         for item in ng.interface.items_tree
         if getattr(item, "item_type", "") == "SOCKET" and item.in_out == "OUTPUT"
     }
+    if len(existing_in) != len(input_specs) or len(existing_out) != len(output_specs):
+        return False
     for s_name, s_type, _ in input_specs:
         if existing_in.get(s_name) != s_type:
             return False
@@ -306,13 +315,15 @@ def _build_soft_knee_upper(
     y: float = 0.0,
 ) -> bpy.types.NodeSocket:
     """Build C^1-smooth tanh upper compression matching ``constants.soft_knee_upper``."""
-    raw_span = _new_math(nt, "SUBTRACT", ceiling, knee, loc=(x, y))
+    ceil_minus_eps = _new_math(nt, "SUBTRACT", ceiling, 1e-4, loc=(x - 240.0, y + 80.0))
+    eff_knee = _new_math(nt, "MINIMUM", knee, ceil_minus_eps, loc=(x - 80.0, y + 80.0))
+    raw_span = _new_math(nt, "SUBTRACT", ceiling, eff_knee, loc=(x, y))
     span = _new_math(nt, "MAXIMUM", raw_span, 1e-6, loc=(x + 160.0, y))
-    delta = _new_math(nt, "SUBTRACT", y_sock, knee, loc=(x, y - 140.0))
+    delta = _new_math(nt, "SUBTRACT", y_sock, eff_knee, loc=(x, y - 140.0))
     arg = _new_math(nt, "DIVIDE", delta, span, loc=(x + 160.0, y - 140.0))
     tanh_val = _new_math(nt, "TANH", arg, loc=(x + 320.0, y - 140.0))
-    compressed = _new_math(nt, "MULTIPLY_ADD", tanh_val, span, knee, loc=(x + 480.0, y - 100.0))
-    is_above = _new_math(nt, "GREATER_THAN", y_sock, knee, loc=(x + 320.0, y + 120.0))
+    compressed = _new_math(nt, "MULTIPLY_ADD", tanh_val, span, eff_knee, loc=(x + 480.0, y - 100.0))
+    is_above = _new_math(nt, "GREATER_THAN", y_sock, eff_knee, loc=(x + 320.0, y + 120.0))
     return _new_mix(
         nt,
         "FLOAT",
@@ -335,14 +346,16 @@ def _build_soft_knee_lower(
     y: float = 0.0,
 ) -> bpy.types.NodeSocket:
     """Build C^1-smooth tanh lower lift matching ``constants.soft_knee_lower``."""
-    raw_span = _new_math(nt, "SUBTRACT", knee, floor, loc=(x, y))
+    floor_plus_eps = _new_math(nt, "ADD", floor, 1e-4, loc=(x - 240.0, y + 80.0))
+    eff_knee = _new_math(nt, "MAXIMUM", knee, floor_plus_eps, loc=(x - 80.0, y + 80.0))
+    raw_span = _new_math(nt, "SUBTRACT", eff_knee, floor, loc=(x, y))
     span = _new_math(nt, "MAXIMUM", raw_span, 1e-6, loc=(x + 160.0, y))
-    delta = _new_math(nt, "SUBTRACT", knee, y_sock, loc=(x, y - 140.0))
+    delta = _new_math(nt, "SUBTRACT", eff_knee, y_sock, loc=(x, y - 140.0))
     arg = _new_math(nt, "DIVIDE", delta, span, loc=(x + 160.0, y - 140.0))
     tanh_val = _new_math(nt, "TANH", arg, loc=(x + 320.0, y - 140.0))
     lift_amt = _new_math(nt, "MULTIPLY", span, tanh_val, loc=(x + 480.0, y - 140.0))
-    lifted = _new_math(nt, "SUBTRACT", knee, lift_amt, loc=(x + 640.0, y - 100.0))
-    is_below = _new_math(nt, "LESS_THAN", y_sock, knee, loc=(x + 320.0, y + 120.0))
+    lifted = _new_math(nt, "SUBTRACT", eff_knee, lift_amt, loc=(x + 640.0, y - 100.0))
+    is_below = _new_math(nt, "LESS_THAN", y_sock, eff_knee, loc=(x + 320.0, y + 120.0))
     return _new_mix(
         nt,
         "FLOAT",
@@ -355,27 +368,32 @@ def _build_soft_knee_lower(
     )
 
 
-def ensure_ctrl_group() -> bpy.types.ShaderNodeTree:
+def ensure_ctrl_group(force_rebuild: bool = False) -> bpy.types.ShaderNodeTree:
     """Create or reuse ``__FLIGHTCHECK_CTRL__`` holding the single O(1) mode switch value."""
     ng = _get_or_create_shader_group(constants.CTRL_GROUP_NAME)
     val_node = ng.nodes.get(_CTRL_VALUE_NODE_NAME)
     out_node = next((n for n in ng.nodes if n.type == "GROUP_OUTPUT"), None)
-    has_mode_out = any(
-        getattr(item, "item_type", "") == "SOCKET"
-        and item.in_out == "OUTPUT"
-        and item.name == "Mode"
-        and item.socket_type == "NodeSocketFloat"
-        for item in ng.interface.items_tree
-    )
     if (
-        val_node is not None
+        not force_rebuild
+        and ng.get("flightcheck_version") == constants.NODE_GROUP_VERSION
+        and len(ng.nodes) > 0
+        and _interface_has_sockets(ng, (), (("Mode", "NodeSocketFloat", 0.0),))
+        and val_node is not None
         and val_node.type == "VALUE"
         and out_node is not None
-        and has_mode_out
-        and (out_sock := get_socket(out_node.inputs, "Mode")) is not None
+        and (out_sock := get_socket(out_node.inputs, "Mode", socket_type="VALUE")) is not None
         and out_sock.is_linked
     ):
         return ng
+
+    prev_mode = float(constants.MODE_OFF)
+    if not force_rebuild and val_node is not None and val_node.type == "VALUE":
+        prev_out = get_socket(val_node.outputs, "Value", socket_type="VALUE")
+        if prev_out is not None:
+            try:
+                prev_mode = float(prev_out.default_value)
+            except (TypeError, ValueError):
+                prev_mode = float(constants.MODE_OFF)
 
     ng.nodes.clear()
     _populate_interface(ng, (), (("Mode", "NodeSocketFloat", 0.0),))
@@ -386,23 +404,37 @@ def ensure_ctrl_group() -> bpy.types.ShaderNodeTree:
     val_node.location = (-200.0, 0.0)
     val_out = get_socket(val_node.outputs, "Value", socket_type="VALUE")
     if val_out is not None:
-        val_out.default_value = float(constants.MODE_OFF)
+        val_out.default_value = prev_mode
 
     out_node = ng.nodes.new("NodeGroupOutput")
     out_node.location = (100.0, 0.0)
     _connect(ng, val_out, get_socket(out_node.inputs, "Mode", socket_type="VALUE"))
+    ng["flightcheck_version"] = constants.NODE_GROUP_VERSION
     return ng
 
 
-def set_ctrl_mode(mode_int: int) -> None:
+def set_ctrl_mode(mode_int: int, *, create: Optional[bool] = None) -> None:
     """Update the shared ``__FLIGHTCHECK_CTRL__`` diagnostic mode in O(1) time."""
+    mode_val = int(mode_int)
+    if create is None:
+        create = mode_val != constants.MODE_OFF
+
+    if not create:
+        ng = bpy.data.node_groups.get(constants.CTRL_GROUP_NAME)
+        if (
+            ng is None
+            or getattr(ng, "bl_idname", "") != "ShaderNodeTree"
+            or not constants.is_editable_id(ng)
+        ):
+            return
     ng = ensure_ctrl_group()
+
     val_node = ng.nodes.get(_CTRL_VALUE_NODE_NAME)
     if val_node is None:
         return
     val_out = get_socket(val_node.outputs, "Value", socket_type="VALUE")
     if val_out is not None:
-        val_out.default_value = float(int(mode_int))
+        val_out.default_value = float(mode_val)
     ng.update_tag()
 
 
@@ -499,6 +531,7 @@ def ensure_overlay_group(force_rebuild: bool = False) -> bpy.types.ShaderNodeTre
     ng = _get_or_create_shader_group(constants.OVERLAY_GROUP_NAME)
     if (
         not force_rebuild
+        and ng.get("flightcheck_version") == constants.NODE_GROUP_VERSION
         and len(ng.nodes) > 0
         and _interface_has_sockets(ng, _OVERLAY_INPUT_SPECS, _OVERLAY_OUTPUT_SPECS)
     ):
@@ -657,6 +690,7 @@ def ensure_overlay_group(force_rebuild: bool = False) -> bpy.types.ShaderNodeTre
         get_socket(mix_shader.outputs, "Shader", socket_type="SHADER"),
         get_socket(go.inputs, "Shader", socket_type="SHADER"),
     )
+    ng["flightcheck_version"] = constants.NODE_GROUP_VERSION
     return ng
 
 
@@ -665,6 +699,7 @@ def ensure_clamp_group(force_rebuild: bool = False) -> bpy.types.ShaderNodeTree:
     ng = _get_or_create_shader_group(constants.CLAMP_GROUP_NAME)
     if (
         not force_rebuild
+        and ng.get("flightcheck_version") == constants.NODE_GROUP_VERSION
         and len(ng.nodes) > 0
         and _interface_has_sockets(ng, _CLAMP_INPUT_SPECS, _CLAMP_OUTPUT_SPECS)
     ):
@@ -805,6 +840,7 @@ def ensure_clamp_group(force_rebuild: bool = False) -> bpy.types.ShaderNodeTree:
     _connect(ng, out_roughness, get_socket(go.inputs, "Roughness", socket_type="VALUE"))
     _connect(ng, out_specular, get_socket(go.inputs, "Specular IOR Level", socket_type="VALUE"))
     _connect(ng, out_ior, get_socket(go.inputs, "IOR", socket_type="VALUE"))
+    ng["flightcheck_version"] = constants.NODE_GROUP_VERSION
     return ng
 
 
@@ -817,6 +853,8 @@ def remove_flightcheck_node_groups(force: bool = False) -> int:
     }
     removed = 0
     for ng in list(bpy.data.node_groups):
+        if not constants.is_editable_id(ng):
+            continue
         if ng.name not in known_names and not ng.name.startswith(constants.PREFIX):
             continue
         if force:

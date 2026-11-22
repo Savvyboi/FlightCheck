@@ -58,6 +58,10 @@ def clear_scene(scene: Optional[bpy.types.Scene] = None) -> None:
         light.use_fake_user = False
         bpy.data.lights.remove(light, do_unlink=True)
 
+    for action in list(bpy.data.actions):
+        action.use_fake_user = False
+        bpy.data.actions.remove(action, do_unlink=True)
+
     if scene is not None and scene.world is not None and scene.world.users == 0:
         bpy.data.worlds.remove(scene.world, do_unlink=True)
 
@@ -87,6 +91,7 @@ def _create_cube_mesh(
     size: float = 1.0,
     uv_scale: float = 1.0,
     create_uv: bool = True,
+    face_uv_scales: Optional[Tuple[float, ...]] = None,
 ) -> bpy.types.Mesh:
     """Create a cube mesh with explicit per-face [0, uv_scale] UVs via bmesh."""
     mesh = bpy.data.meshes.new(name=name)
@@ -95,13 +100,18 @@ def _create_cube_mesh(
         bmesh.ops.create_cube(bm, size=size)
         if create_uv:
             uv_layer = bm.loops.layers.uv.verify()
-            uv_corners = (
-                (0.0, 0.0),
-                (uv_scale, 0.0),
-                (uv_scale, uv_scale),
-                (0.0, uv_scale),
-            )
-            for face in bm.faces:
+            for face_idx, face in enumerate(bm.faces):
+                f_scale = (
+                    float(face_uv_scales[face_idx % len(face_uv_scales)])
+                    if face_uv_scales
+                    else float(uv_scale)
+                )
+                uv_corners = (
+                    (0.0, 0.0),
+                    (f_scale, 0.0),
+                    (f_scale, f_scale),
+                    (0.0, f_scale),
+                )
                 for idx, loop in enumerate(face.loops):
                     u, v = uv_corners[idx % 4]
                     loop[uv_layer].uv = (u, v)

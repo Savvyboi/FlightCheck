@@ -1,8 +1,8 @@
-"""Object transform scale and world-space dimension analysis."""
+"""Object transform scale, delta scale, animation/driver guard, and dimension analysis."""
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import bpy
 
@@ -41,20 +41,95 @@ def _iter_target_mesh_objects(
     return objects
 
 
+def _action_has_scale_fcurves(action: Any, slot_handle: int = 0) -> bool:
+    """Return True if ``action`` keyframes ``scale`` or ``delta_scale`` (slotted or legacy)."""
+    if action is None:
+        return False
+
+    for layer in getattr(action, "layers", ()):
+        for strip in getattr(layer, "strips", ()):
+            for bag in getattr(strip, "channelbags", ()):
+                if slot_handle != 0 and getattr(bag, "slot_handle", 0) != slot_handle:
+                    continue
+                for fc in getattr(bag, "fcurves", ()):
+                    if getattr(fc, "data_path", "") in ("scale", "delta_scale"):
+                        return True
+
+    legacy_fcurves = getattr(action, "fcurves", None)
+    if legacy_fcurves is not None:
+        for fc in legacy_fcurves:
+            if getattr(fc, "data_path", "") in ("scale", "delta_scale"):
+                return True
+
+    return False
+
+
+def has_animated_or_driven_scale(obj: Optional[bpy.types.Object]) -> bool:
+    """Return True if ``obj`` has drivers, keyframes, or NLA strips animating scale/delta_scale."""
+    if obj is None:
+        return False
+    ad = getattr(obj, "animation_data", None)
+    if ad is None:
+        return False
+
+    for drv in getattr(ad, "drivers", ()):
+        dp = getattr(drv, "data_path", "")
+        if dp.startswith("scale") or dp.startswith("delta_scale"):
+            return True
+
+    action = getattr(ad, "action", None)
+    slot_handle = int(getattr(ad, "action_slot_handle", 0) or 0)
+    if _action_has_scale_fcurves(action, slot_handle):
+        return True
+
+    for track in getattr(ad, "nla_tracks", ()):
+        for strip in getattr(track, "strips", ()):
+            strip_action = getattr(strip, "action", None)
+            strip_slot = int(getattr(strip, "action_slot_handle", 0) or 0)
+            if _action_has_scale_fcurves(strip_action, strip_slot):
+                return True
+
+    return False
+
+
+def _non_fixable_reasons(
+    editable: bool,
+    animated: bool,
+    parent_inverted: bool = False,
+) -> List[str]:
+    reasons: List[str] = []
+    if parent_inverted:
+        reasons.append("parent-inherited negative scale")
+    if animated:
+        reasons.append("animated/driven scale")
+    if not editable:
+        reasons.append("linked/non-editable datablock")
+    return reasons
+
+
 def analyze_object_scale(obj: bpy.types.Object) -> Tuple[ObjectScaleInfo, List[DiagnosticIssue]]:
     """Analyze scale uniformity, inversion, applied state, and world dimensions for a mesh object."""
     sx, sy, sz = (float(obj.scale.x), float(obj.scale.y), float(obj.scale.z))
+    ds = getattr(obj, "delta_scale", (1.0, 1.0, 1.0))
+    dsx, dsy, dsz = (float(ds[0]), float(ds[1]), float(ds[2]))
+    eff_sx, eff_sy, eff_sz = (sx * dsx, sy * dsy, sz * dsz)
+    eff_scale = (eff_sx, eff_sy, eff_sz)
+
     dx, dy, dz = (float(obj.dimensions.x), float(obj.dimensions.y), float(obj.dimensions.z))
-    det = float(obj.matrix_world.to_3x3().determinant())
+    world_det = float(obj.matrix_world.to_3x3().determinant())
+    local_det = eff_sx * eff_sy * eff_sz
+
+    local_inverted = (local_det < 0.0) or any(v < 0.0 for v in eff_scale)
+    parent_inverted = (world_det < 0.0) and not local_inverted
+    is_inverted = local_inverted or parent_inverted
 
     tol = constants.SCALE_TOLERANCE
-    is_inverted = (det < 0.0) or (sx < 0.0) or (sy < 0.0) or (sz < 0.0)
-
-    ax, ay, az = abs(sx), abs(sy), abs(sz)
+    ax, ay, az = abs(eff_sx), abs(eff_sy), abs(eff_sz)
     max_abs_diff = max(abs(ax - ay), abs(ay - az), abs(ax - az))
-    is_uniform = max_abs_diff <= tol
+    rel_tol = tol * max(1.0, ax, ay, az)
+    is_uniform = max_abs_diff <= rel_tol
 
-    max_unapplied_delta = max(abs(sx - 1.0), abs(sy - 1.0), abs(sz - 1.0))
+    max_unapplied_delta = max(abs(eff_sx - 1.0), abs(eff_sy - 1.0), abs(eff_sz - 1.0))
     is_applied = (not is_inverted) and (max_unapplied_delta <= tol)
 
     mesh = getattr(obj, "data", None)
@@ -64,10 +139,16 @@ def analyze_object_scale(obj: bpy.types.Object) -> Tuple[ObjectScaleInfo, List[D
     too_large = has_verts and (max_dim > constants.DIM_MAX_METERS)
     has_dimension_outlier = too_small or too_large
 
+    editable = constants.is_editable_id(obj) and constants.is_editable_id(mesh)
+    animated = has_animated_or_driven_scale(obj)
+
     issues: List[DiagnosticIssue] = []
 
     if is_inverted:
-        measured_inv = det if det < 0.0 else min(sx, sy, sz)
+        measured_inv = world_det if world_det < 0.0 else min(eff_scale)
+        inv_reasons = _non_fixable_reasons(editable, animated, parent_inverted=parent_inverted)
+        fixable_inv = len(inv_reasons) == 0
+        suffix = f" [not auto-fixable: {'; '.join(inv_reasons)}]" if inv_reasons else ""
         issues.append(
             DiagnosticIssue(
                 code="SCALE_INVERTED",
@@ -75,14 +156,18 @@ def analyze_object_scale(obj: bpy.types.Object) -> Tuple[ObjectScaleInfo, List[D
                 severity=Severity.CRITICAL,
                 message=(
                     f"Object '{obj.name}' has inverted scale "
-                    f"({sx:.3f}, {sy:.3f}, {sz:.3f}, det={det:.3f})"
+                    f"({eff_sx:.3f}, {eff_sy:.3f}, {eff_sz:.3f}, det={world_det:.3f}){suffix}"
                 ),
                 object_name=obj.name,
                 measured_value=measured_inv,
                 expected_range="det > 0, scale > 0",
-                fixable=True,
+                fixable=fixable_inv,
             )
         )
+
+    local_reasons = _non_fixable_reasons(editable, animated, parent_inverted=False)
+    fixable_local = len(local_reasons) == 0
+    local_suffix = f" [not auto-fixable: {'; '.join(local_reasons)}]" if local_reasons else ""
 
     if not is_uniform:
         issues.append(
@@ -92,12 +177,12 @@ def analyze_object_scale(obj: bpy.types.Object) -> Tuple[ObjectScaleInfo, List[D
                 severity=Severity.CRITICAL,
                 message=(
                     f"Object '{obj.name}' has non-uniform scale "
-                    f"({sx:.3f}, {sy:.3f}, {sz:.3f})"
+                    f"({eff_sx:.3f}, {eff_sy:.3f}, {eff_sz:.3f}){local_suffix}"
                 ),
                 object_name=obj.name,
                 measured_value=max_abs_diff,
-                expected_range=f"max |s_i - s_j| <= {tol:.3f}",
-                fixable=True,
+                expected_range=f"max |s_i - s_j| <= {rel_tol:.3f}",
+                fixable=fixable_local,
             )
         )
     elif not is_inverted and not is_applied:
@@ -108,12 +193,12 @@ def analyze_object_scale(obj: bpy.types.Object) -> Tuple[ObjectScaleInfo, List[D
                 severity=Severity.WARNING,
                 message=(
                     f"Object '{obj.name}' has unapplied uniform scale "
-                    f"({sx:.3f}, {sy:.3f}, {sz:.3f})"
+                    f"({eff_sx:.3f}, {eff_sy:.3f}, {eff_sz:.3f}){local_suffix}"
                 ),
                 object_name=obj.name,
                 measured_value=max_unapplied_delta,
                 expected_range="(1.000, 1.000, 1.000)",
-                fixable=True,
+                fixable=fixable_local,
             )
         )
 
@@ -160,9 +245,9 @@ def analyze_object_scale(obj: bpy.types.Object) -> Tuple[ObjectScaleInfo, List[D
 
     info = ObjectScaleInfo(
         object_name=obj.name,
-        scale=(sx, sy, sz),
+        scale=eff_scale,
         dimensions=(dx, dy, dz),
-        determinant=det,
+        determinant=world_det,
         is_uniform=is_uniform,
         is_applied=is_applied,
         is_inverted=is_inverted,

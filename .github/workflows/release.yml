@@ -1,0 +1,104 @@
+name: Release FlightCheck Extension
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag name (defaults to v<version> from blender_manifest.toml)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Package FlightCheck Blender extension
+        id: package
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag_name }}
+        run: |
+          python3 - <<'EOF'
+          import os
+          import pathlib
+          import tomllib
+          import zipfile
+
+          root = pathlib.Path(".").resolve()
+          manifest_path = root / "blender_manifest.toml"
+          if not manifest_path.is_file():
+              raise SystemExit(f"Missing blender_manifest.toml at {manifest_path}")
+
+          with manifest_path.open("rb") as fh:
+              manifest = tomllib.load(fh)
+
+          ext_id = str(manifest["id"])
+          manifest_version = str(manifest["version"])
+
+          ref_type = os.environ.get("GITHUB_REF_TYPE", "")
+          ref_name = os.environ.get("GITHUB_REF_NAME", "").strip()
+          input_tag = os.environ.get("INPUT_TAG", "").strip()
+
+          if ref_type == "tag" and ref_name:
+              tag = ref_name
+          elif input_tag:
+              tag = input_tag
+          else:
+              tag = f"v{manifest_version}"
+
+          version = manifest_version or (tag[1:] if tag.startswith("v") else tag)
+
+          dist_dir = root / "dist"
+          dist_dir.mkdir(exist_ok=True)
+          zip_name = f"{ext_id}-{version}.zip"
+          zip_path = dist_dir / zip_name
+
+          excluded_dirs = {"tests", ".github", ".git", "__pycache__", "dist"}
+          excluded_files = {".gitignore", ".gitattributes", ".DS_Store", "Thumbs.db"}
+          excluded_suffixes = {".pyc", ".pyo", ".pyd", ".zip", ".blend", ".blend1"}
+
+          entries = []
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+              for path in sorted(root.rglob("*")):
+                  if not path.is_file():
+                      continue
+                  rel = path.relative_to(root)
+                  if any(part in excluded_dirs or part.startswith(".git") for part in rel.parts):
+                      continue
+                  if rel.name in excluded_files or rel.suffix.lower() in excluded_suffixes:
+                      continue
+                  arcname = rel.as_posix()
+                  zf.write(path, arcname=arcname)
+                  entries.append(arcname)
+
+          if "blender_manifest.toml" not in entries:
+              raise SystemExit("blender_manifest.toml was not placed at zip root!")
+
+          print(f"Packaged {zip_name} ({len(entries)} files):")
+          for entry in entries:
+              print(f"  - {entry}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"version={version}\n")
+              out.write(f"tag={tag}\n")
+              out.write(f"zip_path=dist/{zip_name}\n")
+              out.write(f"zip_name={zip_name}\n")
+          EOF
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.package.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: FlightCheck ${{ steps.package.outputs.tag }}
+          files: ${{ steps.package.outputs.zip_path }}
+          generate_release_notes: true

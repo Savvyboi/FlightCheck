@@ -2,46 +2,20 @@
 
 from __future__ import annotations
 
-import importlib
 import time
-from typing import Any, Optional
+from typing import Optional
 
 import bpy
 
 from .. import constants
 from ..state import CACHE, DiagnosticReport
-from . import graph_crawler, scale_analyzer, texel_analyzer
-
-try:
-    from . import pbr_shader_nodes
-except ImportError:
-    pbr_shader_nodes = None  # type: ignore[assignment]
-
-try:
-    from . import shader_splicer
-except ImportError:
-    shader_splicer = None  # type: ignore[assignment]
-
-
-def __getattr__(name: str) -> Any:
-    if name in ("pbr_shader_nodes", "shader_splicer"):
-        mod = importlib.import_module(f".{name}", __name__)
-        globals()[name] = mod
-        return mod
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-def _count_scanned_images(
-    scene: Optional[bpy.types.Scene],
-    selected_only: bool = False,
-) -> int:
-    if scene is None:
-        return 0
-    mat_entries = graph_crawler._iter_scene_materials(scene, selected_only=selected_only)
-    if not mat_entries:
-        return 0
-    materials = [mat for mat, _obj_name in mat_entries]
-    return len(graph_crawler.collect_colorspace_map(materials))
+from . import (
+    graph_crawler,
+    pbr_shader_nodes,
+    scale_analyzer,
+    shader_splicer,
+    texel_analyzer,
+)
 
 
 def run_full_scan(
@@ -56,7 +30,7 @@ def run_full_scan(
     target_td = float(getattr(fc, "target_texel_density", constants.TEXEL_DEFAULT_TARGET))
     default_tex = int(getattr(fc, "default_texture_size", constants.TEXEL_DEFAULT_RES))
 
-    mat_issues, scanned_materials = graph_crawler.scan_scene_materials(
+    mat_issues, scanned_materials, scanned_images = graph_crawler.scan_scene_materials_with_stats(
         scene,
         selected_only=selected_only,
     )
@@ -74,7 +48,6 @@ def run_full_scan(
 
     all_issues = mat_issues + scale_issues + texel_issues
     scanned_objects = max(len(scale_info), len(texel_stats))
-    scanned_images = _count_scanned_images(scene, selected_only=selected_only)
     elapsed_ms = (time.perf_counter() - t_start) * 1000.0
 
     report = DiagnosticReport(
@@ -86,7 +59,7 @@ def run_full_scan(
         scanned_images=scanned_images,
         scan_duration_ms=elapsed_ms,
     )
-    CACHE.set_report(report)
+    CACHE.set_report(report, scene=scene)
     return report
 
 

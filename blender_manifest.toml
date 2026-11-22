@@ -19,5 +19,9 @@ license = [
 paths_exclude_pattern = [
   "__pycache__/",
   "/.git/",
+  "/.github/",
+  "/.gitignore",
+  "/.gitattributes",
+  "/tests/",
   "/*.zip",
 ]

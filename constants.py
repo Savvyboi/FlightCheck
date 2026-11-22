@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Iterable, Tuple
+from typing import Any, Dict, Iterable, Tuple
 
 # Internal naming prefixes and datablock identifiers
 PREFIX = "__FLIGHTCHECK_"
@@ -14,6 +14,9 @@ CTRL_NODE_NAME = "__FLIGHTCHECK_CTRL_NODE__"
 OVERLAY_NODE_NAME = "__FLIGHTCHECK_OVERLAY_NODE__"
 CLAMP_NODE_NAME = "__FLIGHTCHECK_CLAMP_NODE__"
 TEXEL_ATTR_NAME = "__flightcheck_td"
+
+# Bump whenever internal overlay/clamp/ctrl shader group graphs change
+NODE_GROUP_VERSION = 2
 
 # Diagnostic visualization modes
 MODE_OFF = 0
@@ -60,11 +63,12 @@ IOR_MIN = 1.30
 IOR_MAX = 1.80
 TRANSMISSION_THRESHOLD = 0.5
 
-# Texel density thresholds and attribute encoding
+# Texel density thresholds, presets, and attribute encoding
 TEXEL_RATIO_MIN = 0.5
 TEXEL_RATIO_MAX = 2.0
 TEXEL_DEFAULT_TARGET = 1024.0
 TEXEL_DEFAULT_RES = 1024
+TEXEL_PRESETS: Tuple[int, ...] = (256, 512, 1024, 2048, 4096)
 TEXEL_ATTR_MIN_VALID = 0.05
 TEXEL_ATTR_PRESENCE_EPS = 0.005
 
@@ -140,6 +144,36 @@ DATA_ONLY_NODE_TYPES = frozenset({
     "VECTOR_DISPLACEMENT",
 })
 
+SRGB_DISPLAY_SPACES = frozenset({
+    "sRGB",
+    "AgX Base sRGB",
+    "Filmic sRGB",
+    "Khronos PBR Neutral sRGB",
+})
+
+ISSUE_LABELS: Dict[str, str] = {
+    "DIELECTRIC_CRUSHED_BLACK": "Crushed Black Albedo",
+    "BLOWN_ALBEDO_CRIT": "Blown Albedo (Critical)",
+    "BLOWN_ALBEDO_WARN": "Blown Albedo (High)",
+    "DARK_METAL": "Dark Conductor Albedo",
+    "SEMI_METAL": "Semi-Metal Value",
+    "MIRROR_ROUGHNESS": "Mirror Roughness (<0.02)",
+    "DEAD_ROUGHNESS": "Dead Roughness (>0.98)",
+    "SPECULAR_OUTLIER": "Specular IOR Outlier",
+    "IOR_OUTLIER": "Dielectric IOR Outlier",
+    "DATA_MAP_SRGB": "Non-Color Data Map Bug",
+    "UNEVALUABLE_INPUT": "Dynamic Node Graph",
+    "SCALE_INVERTED": "Inverted Object Scale",
+    "SCALE_NON_UNIFORM": "Non-Uniform Scale",
+    "SCALE_UNAPPLIED": "Unapplied Scale",
+    "DIMENSION_TOO_SMALL": "Tiny Dimension (<1mm)",
+    "DIMENSION_TOO_LARGE": "Huge Dimension (>500m)",
+    "TEXEL_NO_UV": "Missing UV Map",
+    "TEXEL_LOW": "Low Texel Density",
+    "TEXEL_HIGH": "High Texel Density",
+    "TEXEL_SHARED_MESH_SCALE": "Shared Mesh Scale Conflict",
+}
+
 # False-color diagnostic RGBA palettes (linear values for shader nodes / GPU)
 COLOR_CRUSHED_BLACK = (0.05, 0.25, 1.0, 1.0)
 COLOR_BLOWN_WARN = (1.0, 0.5, 0.0, 1.0)
@@ -159,17 +193,30 @@ COLOR_TEXEL_HIGH = (1.0, 0.12, 0.10, 1.0)
 HUD_COLOR_GO = (0.16, 0.86, 0.44, 1.0)
 HUD_COLOR_CAUTION = (1.0, 0.65, 0.12, 1.0)
 HUD_COLOR_NO_GO = (1.0, 0.22, 0.22, 1.0)
+HUD_COLOR_INFO = (0.35, 0.70, 1.0, 1.0)
 HUD_BG = (0.05, 0.07, 0.10, 0.84)
 HUD_PANEL_BG = (0.09, 0.12, 0.16, 0.92)
 HUD_BORDER = (0.28, 0.36, 0.46, 0.90)
 HUD_TEXT_PRIMARY = (0.93, 0.96, 1.0, 1.0)
 HUD_TEXT_MUTED = (0.62, 0.70, 0.80, 1.0)
 HUD_BANNER_BG = (0.55, 0.12, 0.08, 0.94)
+HUD_STALE_BG = (0.48, 0.32, 0.06, 0.94)
 
 # 3D wireframe bounding cage colors
 CAGE_COLOR_CRIT = (1.0, 0.15, 0.15, 0.95)
 CAGE_COLOR_WARN = (1.0, 0.62, 0.10, 0.90)
 CAGE_COLOR_DIM = (1.0, 0.92, 0.12, 0.90)
+
+
+def is_editable_id(datablock: Any) -> bool:
+    """Return True if ``datablock`` is local, non-override, and editable."""
+    if datablock is None:
+        return False
+    if getattr(datablock, "library", None) is not None:
+        return False
+    if getattr(datablock, "override_library", None) is not None:
+        return False
+    return bool(getattr(datablock, "is_editable", True))
 
 
 def linear_luminance(rgb: Iterable[float]) -> float:
@@ -190,18 +237,22 @@ def srgb_to_linear(c: float) -> float:
 
 def soft_knee_upper(y: float, knee: float, ceiling: float) -> float:
     """Apply C^1-smooth hyperbolic tangent compression above ``knee`` toward ``ceiling``."""
-    if y <= knee:
+    ceil_f = float(ceiling)
+    eff_knee = min(float(knee), ceil_f - 1e-4)
+    if y <= eff_knee:
         return y
-    span = max(ceiling - knee, 1e-6)
-    return knee + span * math.tanh((y - knee) / span)
+    span = max(ceil_f - eff_knee, 1e-6)
+    return eff_knee + span * math.tanh((y - eff_knee) / span)
 
 
 def soft_knee_lower(y: float, floor: float, knee: float) -> float:
     """Apply C^1-smooth hyperbolic tangent lift below ``knee`` toward ``floor``."""
-    if y >= knee:
+    floor_f = float(floor)
+    eff_knee = max(float(knee), floor_f + 1e-4)
+    if y >= eff_knee:
         return y
-    span = max(knee - floor, 1e-6)
-    return knee - span * math.tanh((knee - y) / span)
+    span = max(eff_knee - floor_f, 1e-6)
+    return eff_knee - span * math.tanh((eff_knee - y) / span)
 
 
 def soft_knee_clamp_metallic(m: float, is_linked: bool = False) -> float:

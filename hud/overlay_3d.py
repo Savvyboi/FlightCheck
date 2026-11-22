@@ -151,7 +151,7 @@ def draw_overlay_3d() -> None:
     if settings is None or not settings.enabled or not settings.show_overlay_3d:
         return
 
-    report = CACHE.get_report()
+    report = CACHE.get_report(context.scene)
     if report is None:
         return
 
